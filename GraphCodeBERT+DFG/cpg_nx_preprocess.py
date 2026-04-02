@@ -118,7 +118,7 @@ def preprocess_cpg_sub(G, tokenizer, cpg_embeddings):
         if len(feature_id) > 0:
             feature = cpg_embeddings[feature_id].mean(axis=0)
         else:
-            feature = np.zeros(768)
+            feature = np.zeros(cpg_embeddings.shape[1])
 
         cpg_features.append(feature)
     X = np.stack(cpg_features)

@@ -28,7 +28,7 @@ from transformers import (AdamW, get_linear_schedule_with_warmup,
                           OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
                           RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,RobertaModel,
                           DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
-
+from transformers import T5Config, T5ForConditionalGeneration, RobertaTokenizer
 cpu_cont = multiprocessing.cpu_count()
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ MODEL_CLASSES = {
     'openai-gpt': (OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer),
     'bert': (BertConfig, BertForMaskedLM, BertTokenizer),
     'roberta': (RobertaConfig, RobertaModel, RobertaTokenizer),
+    'codet5': (T5Config, T5ForConditionalGeneration, RobertaTokenizer),
     'distilbert': (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
 }
 
@@ -105,7 +106,7 @@ class TextDataset(Dataset):
         self.examples = []
         self.args = args
         self.tokenizer = tokenizer
-        self.cpg_embeddings = encoder_model.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
+        self.cpg_embeddings = encoder_model.shared.weight.data.cpu().detach().clone().numpy()
 
         with open(file_path) as f:
             # 1. 读取所有行并缓存

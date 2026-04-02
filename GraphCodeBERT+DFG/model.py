@@ -13,9 +13,9 @@ class GraphCodeBERT(nn.Module):
         self.tokenizer = tokenizer
         self.args = args
 
-        self.graphEmb = GraphEmbedding(feature_dim_size=768, hidden_size=256, dropout=config.hidden_dropout_prob)
+        self.graphEmb = GraphEmbedding(feature_dim_size=768, hidden_size=256, dropout=config.dropout_rate)
 
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.dropout = nn.Dropout(config.dropout_rate)
         self.classifier = PredictionClassification(config, args, input_size= 1024)
         
         # 新增：冻结 RoBERTa 前 n 层（例如冻结前 6 层）
@@ -26,18 +26,44 @@ class GraphCodeBERT(nn.Module):
                 # param.requires_grad = False
 
             # 冻结 Transformer 编码器的前 n 层
-            for layer in self.encoder.encoder.layer[:n_freeze_layers]:
-                for param in layer.parameters():
+            for block in self.encoder.encoder.block[:n_freeze_layers]:
+                for param in block.parameters():
                     param.requires_grad = False
-        
+
+    def get_t5_vec(self, source_ids):
+        """
+        走完整 encoder-decoder，取 decoder 最后一层 <eos> 位置的向量。
+        labels=source_ids 触发 teacher forcing，让 decoder 有输出的 hidden states。
+        """
+        attention_mask = source_ids.ne(self.tokenizer.pad_token_id)
+        outputs = self.encoder(
+            input_ids=source_ids,
+            attention_mask=attention_mask,
+            labels=source_ids,
+            decoder_attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        # decoder 最后一层的所有 token 的隐状态，shape: [B, seq_len, hidden]
+        hidden_states = outputs.decoder_hidden_states[-1]
+
+        # 找每个样本中 <eos> token 的位置
+        eos_mask = source_ids.eq(self.tokenizer.eos_token_id)
+
+        # 校验：每个样本必须有且只有相同数量的 <eos>（通常是1个）
+        if len(torch.unique(eos_mask.sum(1))) > 1:
+            raise ValueError("All examples must have the same number of <eos> tokens.")
+
+        # 取每个样本最后一个 <eos> 的向量，shape: [B, hidden]
+        vec = hidden_states[eos_mask, :].view(
+            hidden_states.size(0), -1, hidden_states.size(-1)
+        )[:, -1, :]
+
+        return vec
 
     def forward(self, inputs_ids=None, attn_mask=None, position_idx=None, labels=None, ast_adj=None, cfg_adj=None, pdg_adj=None, node_features=None, node_mask=None):
         g_emb = self.graphEmb(node_features.to(device).float(), ast_adj.to(device).float(), cfg_adj.to(device).float(), pdg_adj.to(device).float(), node_mask.to(device).float())
-        
 
-        inputs_embeddings = self.encoder.embeddings.word_embeddings(inputs_ids)
-
-        vec = self.encoder(inputs_embeds=inputs_embeddings,attention_mask=attn_mask, position_ids=position_idx)[0][:, 0, :]
+        vec = self.get_t5_vec(inputs_ids)
         outputs = self.classifier(torch.cat((vec, g_emb), dim=1))
         logits = outputs.squeeze(-1)
 
