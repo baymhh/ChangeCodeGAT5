@@ -48,8 +48,6 @@ class InputFeatures(object):
                  input_tokens,
                  input_ids,
                  position_idx,
-                 dfg_to_code,
-                 dfg_to_dfg,
                  idx,
                  label,
                  cpg_object
@@ -58,8 +56,6 @@ class InputFeatures(object):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
         self.position_idx = position_idx
-        self.dfg_to_code = dfg_to_code
-        self.dfg_to_dfg = dfg_to_dfg
         self.idx = str(idx)
         self.label = label
         self.cpg_object = cpg_object
@@ -68,36 +64,17 @@ class InputFeatures(object):
 def convert_examples_to_features_graphcodebert(js, tokenizer, args, pkl_dir_path=None):
     # source
     code = ' '.join(js['func'].split())
-    dfg, index_table, code_tokens = extract_dataflow(code, "c")
-
-    code_tokens = [tokenizer.tokenize('@ ' + x)[1:] if idx != 0 else tokenizer.tokenize(x) for idx, x in
-                   enumerate(code_tokens)]
-    ori2cur_pos = {}
-    ori2cur_pos[-1] = (0, 0)
-    for i in range(len(code_tokens)):
-        ori2cur_pos[i] = (ori2cur_pos[i - 1][1], ori2cur_pos[i - 1][1] + len(code_tokens[i]))
-    code_tokens = [y for x in code_tokens for y in x]
-
-    # 代码长度截断，不要融入数据流的长度
-    code_tokens = code_tokens[:args.code_length + args.data_flow_length - 2]
+    code_tokens = tokenizer.tokenize(code)[:args.code_length + args.data_flow_length - 2]
     source_tokens = [tokenizer.cls_token] + code_tokens + [tokenizer.sep_token]
     source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
     position_idx = [i + tokenizer.pad_token_id + 1 for i in range(len(source_tokens))]
-    dfg = dfg[:args.code_length + args.data_flow_length - len(source_tokens)]
+
 
     padding_length = args.code_length + args.data_flow_length - len(source_ids)
     position_idx += [tokenizer.pad_token_id] * padding_length
     source_ids += [tokenizer.pad_token_id] * padding_length
 
-    reverse_index = {}
-    for idx, x in enumerate(dfg):
-        reverse_index[x[1]] = idx
-    for idx, x in enumerate(dfg):
-        dfg[idx] = x[:-1] + ([reverse_index[i] for i in x[-1] if i in reverse_index],)
-    dfg_to_dfg = [x[-1] for x in dfg]
-    dfg_to_code = [ori2cur_pos[x[1]] for x in dfg]
-    length = len([tokenizer.cls_token])
-    dfg_to_code = [(x[0] + length, x[1] + length) for x in dfg_to_code]
+
 
     # ---------------------- 新增部分：加载.pkl文件，获取cpg_object（G） ----------------------
     cpg_object = None  # 初始化cpg_object为None
@@ -120,7 +97,7 @@ def convert_examples_to_features_graphcodebert(js, tokenizer, args, pkl_dir_path
             print(f"警告：加载.pkl文件失败，cpg_object保持None，异常信息：{e}")
     # -------------------------------------------------------------------------------------
 
-    return InputFeatures(source_tokens, source_ids, position_idx, dfg_to_code, dfg_to_dfg, js['idx'], js['target'], cpg_object=cpg_object)
+    return InputFeatures(source_tokens, source_ids, position_idx, js['idx'], js['target'], cpg_object=cpg_object)
 
 
 class TextDataset(Dataset):
@@ -168,10 +145,10 @@ class TextDataset(Dataset):
                               self.args.code_length + self.args.data_flow_length), dtype=np.bool_)
         # calculate begin index of node and max length of input
 
-        node_index = sum([i > 1 for i in self.examples[item].position_idx])
+
         max_length = sum([i != 1 for i in self.examples[item].position_idx])
         # sequence can attend to sequence
-        attn_mask[:node_index, :node_index] = True
+        attn_mask[:max_length, :max_length] = True
         # special tokens attend to all tokens
         for idx, i in enumerate(self.examples[item].input_ids):
             if i in [0, 2]:
