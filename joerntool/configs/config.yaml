@@ -1,0 +1,8 @@
+joern:
+  joern_path_root: "/opt/joern/joern-cli"
+  joern_path_parse: "${joern.joern_path_root}/joern-parse"
+  joern_path_export: "${joern.joern_path_root}/joern-export"
+  data_folder: "data"
+  export_format: [ 'cpg14' ]
+  export_type: 'dot'
+  generate_file_suffix: '.c'
