@@ -17,28 +17,17 @@ from cpg_nx_preprocess import preprocess_cpg_sub
 import torch.nn.functional as F
 
 from tqdm import tqdm
-from model import GraphCodeBERT
-from run_parser import extract_dataflow
+from model import CodeT5GraphModel
 from torch.utils.data.distributed import DistributedSampler
 from sklearn.metrics import f1_score, precision_score, recall_score
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
 from transformers import (AdamW, get_linear_schedule_with_warmup,
-                          BertConfig, BertForMaskedLM, BertTokenizer,
-                          GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
-                          OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer,
-                          RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,RobertaModel,
-                          DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
-from transformers import T5Config, T5ForConditionalGeneration, RobertaTokenizer
+                          T5Config, T5ForConditionalGeneration, RobertaTokenizer)
 cpu_cont = multiprocessing.cpu_count()
 logger = logging.getLogger(__name__)
 
 MODEL_CLASSES = {
-    'gpt2': (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
-    'openai-gpt': (OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer),
-    'bert': (BertConfig, BertForMaskedLM, BertTokenizer),
-    'roberta': (RobertaConfig, RobertaModel, RobertaTokenizer),
-    'codet5': (T5Config, T5ForConditionalGeneration, RobertaTokenizer),
-    'distilbert': (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer)
+    'codet5': (T5Config, T5ForConditionalGeneration, RobertaTokenizer)
 }
 
 
@@ -48,7 +37,6 @@ class InputFeatures(object):
     def __init__(self,
                  input_tokens,
                  input_ids,
-                 position_idx,
                  idx,
                  label,
                  cpg_object
@@ -56,24 +44,25 @@ class InputFeatures(object):
                  ):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
-        self.position_idx = position_idx
         self.idx = str(idx)
         self.label = label
         self.cpg_object = cpg_object
 
 
-def convert_examples_to_features_graphcodebert(js, tokenizer, args, pkl_dir_path=None):
+def convert_examples_to_features(js, tokenizer, args, pkl_dir_path=None):
     # source
     code = ' '.join(js['func'].split())
-    code_tokens = tokenizer.tokenize(code)[:args.code_length + args.data_flow_length - 2]
-    source_tokens = [tokenizer.cls_token] + code_tokens + [tokenizer.sep_token]
-    source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
-    position_idx = [i + tokenizer.pad_token_id + 1 for i in range(len(source_tokens))]
+    max_length = args.code_length
+    source_ids = tokenizer.encode(
+        code,
+        max_length=max_length,
+        padding='max_length',
+        truncation=True
+    )
+    source_tokens = tokenizer.convert_ids_to_tokens(source_ids)
 
 
-    padding_length = args.code_length + args.data_flow_length - len(source_ids)
-    position_idx += [tokenizer.pad_token_id] * padding_length
-    source_ids += [tokenizer.pad_token_id] * padding_length
+
 
 
 
@@ -98,7 +87,7 @@ def convert_examples_to_features_graphcodebert(js, tokenizer, args, pkl_dir_path
             print(f"警告：加载.pkl文件失败，cpg_object保持None，异常信息：{e}")
     # -------------------------------------------------------------------------------------
 
-    return InputFeatures(source_tokens, source_ids, position_idx, js['idx'], js['target'], cpg_object=cpg_object)
+    return InputFeatures(source_tokens, source_ids, js['idx'], js['target'], cpg_object=cpg_object)
 
 
 class TextDataset(Dataset):
@@ -126,7 +115,7 @@ class TextDataset(Dataset):
                 project_root_diro = os.path.dirname(current_script_diro)
                 pkl_dir_path = os.path.join(project_root_diro, 'joerntool', 'joern', 'data', 'runtrydata',
                                             f'cpg14_output_pickle_{split_name}')
-                self.examples.append(convert_examples_to_features_graphcodebert(js, self.tokenizer, args, pkl_dir_path))
+                self.examples.append(convert_examples_to_features(js, self.tokenizer, args, pkl_dir_path))
 
         if 'train' in file_path:
             for idx, example in enumerate(self.examples[:3]):
@@ -141,27 +130,10 @@ class TextDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, item):
-        # calculate graph-guided masked function
-        attn_mask = np.zeros((self.args.code_length + self.args.data_flow_length,
-                              self.args.code_length + self.args.data_flow_length), dtype=np.bool_)
-        # calculate begin index of node and max length of input
-
-
-        max_length = sum([i != 1 for i in self.examples[item].position_idx])
-        # sequence can attend to sequence
-        attn_mask[:max_length, :max_length] = True
-        # special tokens attend to all tokens
-        for idx, i in enumerate(self.examples[item].input_ids):
-            if i in [0, 2]:
-                attn_mask[idx, :max_length] = True
-
-
         ast_adj, cfg_adj, pdg_adj, cpg_node_features = preprocess_cpg_sub(self.examples[item],
                                                                           self.tokenizer, self.cpg_embeddings)
 
         return (torch.tensor(self.examples[item].input_ids),
-                torch.tensor(attn_mask),
-                torch.tensor(self.examples[item].position_idx),
                 torch.tensor(self.examples[item].label),
                 torch.tensor(ast_adj),
                 torch.tensor(cfg_adj),
@@ -181,7 +153,7 @@ def set_seed(seed=42):
 # 加一个批加载器collate_fn
 def collate_fn(batch):
     # 解包
-    input_ids_list, attn_mask_list, pos_idx_list = [], [], []
+    input_ids_list = []
     labels_list = []
     ast_adj_list, cfg_adj_list, pdg_adj_list = [], [], []
     feats_list = []
@@ -191,20 +163,16 @@ def collate_fn(batch):
 
     for item in batch:
         input_ids_list.append(item[0])
-        attn_mask_list.append(item[1])
-        pos_idx_list.append(item[2])
-        labels_list.append(item[3])
-        ast_adj_list.append(item[4])
-        cfg_adj_list.append(item[5])
-        pdg_adj_list.append(item[6])
-        feats_list.append(item[7])
-        num_nodes_list.append(item[7].size(0))  # N
+        labels_list.append(item[1])
+        ast_adj_list.append(item[2])
+        cfg_adj_list.append(item[3])
+        pdg_adj_list.append(item[4])
+        feats_list.append(item[5])
+        num_nodes_list.append(item[5].size(0))  # N
 
     # ========== 文本部分 ==========
     # 如果你已经在 tokenizer 中 pad 到固定长度：
     input_ids = torch.stack(input_ids_list)
-    attention_mask = torch.stack(attn_mask_list)
-    position_idx = torch.stack(pos_idx_list)
     labels = torch.stack(labels_list)
 
     # ========== 图部分 ==========
@@ -234,8 +202,6 @@ def collate_fn(batch):
     # 注意train中取数据时因为从元组变字典了，取数据的方式要变！！！！！！！！！
     return {
         'input_ids': input_ids,
-        'attention_mask': attention_mask,
-        'position_idx': position_idx,
         'labels': labels,
         'ast_adj': ast_batch,
         'cfg_adj': cfg_batch,
@@ -262,18 +228,18 @@ def train(args, train_dataset, model, tokenizer, modelencoder):
     
     
     # === FROZEN LAYERS VERIFICATION ===
-    print("\n VERIFICATION: Frozen parameters in GraphCodeBERT")
+    print("\n VERIFICATION: Frozen parameters in CodeT5GraphModel")
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_percent = (total_params - trainable_params) / total_params * 100
     print(f"   Total params: {total_params:,} | Trainable: {trainable_params:,} ({trainable_params/total_params*100:.1f}%) | Frozen: {frozen_percent:.1f}%")
 
     # Print encoder layer status
-    if hasattr(model, 'encoder') and hasattr(model.encoder, 'encoder') and hasattr(model.encoder.encoder, 'layer'):
-        for i, layer in enumerate(model.encoder.encoder.layer):
-            layer_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
-            status = "FROZEN" if layer_trainable == 0 else "TRAINABLE"
-            print(f"   Encoder Layer {i}: {status}")
+    if hasattr(model, 'encoder') and hasattr(model.encoder, 'encoder') and hasattr(model.encoder.encoder, 'block'):
+        for i, block in enumerate(model.encoder.encoder.block):
+            block_trainable = sum(p.numel() for p in block.parameters() if p.requires_grad)
+            status = "FROZEN" if block_trainable == 0 else "TRAINABLE"
+            print(f"   Encoder Block {i}: {status}")
     print("===================================\n")
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
@@ -328,8 +294,6 @@ def train(args, train_dataset, model, tokenizer, modelencoder):
         for step, batch in enumerate(bar):
             # 从 batch dict 中提取并移到设备上(原来是元组，现在是字典)
             input_ids = batch['input_ids'].to(args.device)
-            attention_mask = batch['attention_mask'].to(args.device)
-            position_idx = batch['position_idx'].to(args.device)
             labels = batch['labels'].to(args.device)
 
             ast_adj = batch['ast_adj'].to(args.device)  # [B, M, M]
@@ -341,7 +305,7 @@ def train(args, train_dataset, model, tokenizer, modelencoder):
             model.train()
 
             # 传参给模型的时候也要改
-            loss, logits = model(input_ids, attention_mask, position_idx, labels, ast_adj, cfg_adj, pdg_adj,
+            loss, logits = model(input_ids, labels, ast_adj, cfg_adj, pdg_adj,
                                  node_features, node_mask)
 
             if args.n_gpu > 1:
@@ -438,8 +402,6 @@ def evaluate(args, model, tokenizer, modelencoder, eval_when_training=False):
     for batch in tqdm(eval_dataloader, total=len(eval_dataloader)):
         # 从 batch dict 中提取并移到设备上(原来是元组，现在是字典)
         input_ids = batch['input_ids'].to(args.device)
-        attention_mask = batch['attention_mask'].to(args.device)
-        position_idx = batch['position_idx'].to(args.device)
         label = batch['labels'].to(args.device)
 
         ast_adj = batch['ast_adj'].to(args.device)  # [B, M, M, 1]
@@ -450,7 +412,7 @@ def evaluate(args, model, tokenizer, modelencoder, eval_when_training=False):
 
         # 传参给模型的时候也要改
         with torch.no_grad():
-            logit = model(input_ids, attention_mask, position_idx, None,
+            logit = model(input_ids, None,
                           ast_adj, cfg_adj, pdg_adj,
                           node_features, node_mask)
 
@@ -513,8 +475,6 @@ def test(args, model, tokenizer, modelencoder):
     for batch in tqdm(eval_dataloader, total=len(eval_dataloader)):
         # 从 batch dict 中提取并移到设备上(原来是元组，现在是字典)
         input_ids = batch['input_ids'].to(args.device)
-        attention_mask = batch['attention_mask'].to(args.device)
-        position_idx = batch['position_idx'].to(args.device)
         label = batch['labels'].to(args.device)
 
         ast_adj = batch['ast_adj'].to(args.device)  # [B, M, M, 1]
@@ -522,11 +482,10 @@ def test(args, model, tokenizer, modelencoder):
         pdg_adj = batch['pdg_adj'].to(args.device)  # [B, M, M, 1]
         node_features = batch['node_features'].to(args.device)  # [B, M, F]
         node_mask = batch['node_mask'].to(args.device)  # [B, M]
-        node_mask = batch['node_mask'].to(args.device)  # [B, M]
 
         # 传参给模型的时候也要改
         with torch.no_grad():
-            logit = model(input_ids, attention_mask, position_idx, None,
+            logit = model(input_ids, None,
                           ast_adj, cfg_adj, pdg_adj,
                           node_features, node_mask)
 
@@ -616,8 +575,6 @@ def main():
                         help="Optional directory to store the pre-trained models downloaded from s3 (instread of the default one)")
     parser.add_argument("--code_length", default=256, type=int,
                         help="Optional Code input sequence length after tokenization.")
-    parser.add_argument("--data_flow_length", default=64, type=int,
-                        help="Optional Data Flow input sequence length after tokenization.")
     parser.add_argument("--do_train", action='store_true',
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true',
@@ -739,7 +696,7 @@ def main():
 
     # 先保留一下这个副本
     modelencoder = model
-    model = GraphCodeBERT(model, config, tokenizer, args)
+    model = CodeT5GraphModel(model, config, tokenizer, args)
     if args.local_rank == 0:
         torch.distributed.barrier()  # End of barrier to make sure only the first process in distributed training download model & vocab
 

@@ -5,9 +5,9 @@ from utils import *
 from Layers import *
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class GraphCodeBERT(nn.Module):
+class CodeT5GraphModel(nn.Module):
     def __init__(self, encoder, config, tokenizer, args):
-        super(GraphCodeBERT, self).__init__()
+        super(CodeT5GraphModel, self).__init__()
         self.encoder = encoder
         self.config = config
         self.tokenizer = tokenizer
@@ -18,14 +18,9 @@ class GraphCodeBERT(nn.Module):
         self.dropout = nn.Dropout(config.dropout_rate)
         self.classifier = PredictionClassification(config, args, input_size= 1024)
         
-        # 新增：冻结 RoBERTa 前 n 层（例如冻结前 6 层）
+        # 新增：冻结 CodeT5 encoder 前 n 层（例如冻结前 6 层）
         n_freeze_layers = 8  # ← 你可根据实验调整：0=全放开，12=全冻结
         if n_freeze_layers > 0:
-            # 冻结 embeddings（可选，通常保留）
-            # for param in self.encoder.embeddings.parameters():
-                # param.requires_grad = False
-
-            # 冻结 Transformer 编码器的前 n 层
             for block in self.encoder.encoder.block[:n_freeze_layers]:
                 for param in block.parameters():
                     param.requires_grad = False
@@ -60,7 +55,7 @@ class GraphCodeBERT(nn.Module):
 
         return vec
 
-    def forward(self, inputs_ids=None, attn_mask=None, position_idx=None, labels=None, ast_adj=None, cfg_adj=None, pdg_adj=None, node_features=None, node_mask=None):
+    def forward(self, inputs_ids=None, labels=None, ast_adj=None, cfg_adj=None, pdg_adj=None, node_features=None, node_mask=None):
         g_emb = self.graphEmb(node_features.to(device).float(), ast_adj.to(device).float(), cfg_adj.to(device).float(), pdg_adj.to(device).float(), node_mask.to(device).float())
 
         vec = self.get_t5_vec(inputs_ids)
